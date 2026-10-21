@@ -51,6 +51,10 @@ pub struct RedlockConfig {
     pub acquire_timeout: Duration,
     /// Delay between acquisition retries.
     pub retry_delay: Duration,
+    /// Clock drift adjustment factor (default 0.01 = 1% of TTL).
+    pub drift_factor: f64,
+    /// Standard round-trip network latency variance.
+    pub network_variance: Duration,
 }
 
 impl Default for RedlockConfig {
@@ -60,6 +64,8 @@ impl Default for RedlockConfig {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             acquire_timeout: Duration::from_secs(5),
             retry_delay: Duration::from_millis(50),
+            drift_factor: 0.01,
+            network_variance: Duration::from_millis(2),
         }
     }
 }
@@ -72,6 +78,11 @@ impl RedlockConfig {
         if self.heartbeat_interval >= self.ttl {
             return Err(LockError::InvalidConfig(
                 "heartbeat_interval must be less than ttl".into(),
+            ));
+        }
+        if self.drift_factor < 0.0 || !self.drift_factor.is_finite() {
+            return Err(LockError::InvalidConfig(
+                "drift_factor must be non-negative and finite".into(),
             ));
         }
         Ok(())
@@ -185,8 +196,9 @@ impl RedlockManager {
                 }
             }
 
-            // Factor max clock drift: (ttl * 0.01 + 2ms) per Redlock spec
-            let drift = Duration::from_millis(((ttl_ms as f64 * 0.01) + 2.0) as u64);
+            // Factor max clock drift: (ttl * drift_factor + network_variance) per Redlock spec
+            let drift = Duration::from_secs_f64(self.config.ttl.as_secs_f64() * self.config.drift_factor)
+                .saturating_add(self.config.network_variance);
             let elapsed = start_time.elapsed();
             let validity = self.config.ttl.checked_sub(elapsed + drift);
 
@@ -358,6 +370,7 @@ mod tests {
                 heartbeat_interval: ttl / 3,
                 acquire_timeout: Duration::from_millis(200),
                 retry_delay: Duration::from_millis(10),
+                ..RedlockConfig::default()
             },
         )
         .unwrap()
@@ -434,5 +447,26 @@ mod tests {
             },
         );
         assert!(matches!(res, Err(LockError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn custom_drift_factor_and_network_variance() {
+        let config = RedlockConfig {
+            drift_factor: 0.05,
+            network_variance: Duration::from_millis(50),
+            ..RedlockConfig::default()
+        };
+        assert_eq!(config.drift_factor, 0.05);
+        assert_eq!(config.network_variance, Duration::from_millis(50));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_drift_factor() {
+        let config = RedlockConfig {
+            drift_factor: -0.01,
+            ..RedlockConfig::default()
+        };
+        assert!(matches!(config.validate(), Err(LockError::InvalidConfig(_))));
     }
 }

@@ -81,19 +81,86 @@ impl IngestionConfig {
     }
 }
 
-/// A single ledger batch pulled from Soroban RPC.
+/// Contract event to be persisted during ledger batch ingestion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngestionEvent {
+    pub id: Option<uuid::Uuid>,
+    pub contract_id: String,
+    pub ledger_sequence: i64,
+    pub transaction_hash: String,
+    pub event_index: i32,
+    pub event_type: String,
+    pub topics: serde_json::Value,
+    pub data: serde_json::Value,
+}
+
+/// Transaction or contract call log to be persisted during ledger batch ingestion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestionTransactionLog {
+    pub contract_id: String,
+    pub function_name: String,
+    pub arguments: serde_json::Value,
+    pub caller: Option<String>,
+    pub status: String,
+    pub gas_used: f64,
+}
+
+/// A single ledger batch pulled from Soroban RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LedgerBatch {
     pub sequence: u64,
     pub tx_count: u32,
     pub closed_at: u64,
+    #[serde(default)]
+    pub events: Vec<IngestionEvent>,
+    #[serde(default)]
+    pub tx_logs: Vec<IngestionTransactionLog>,
 }
 
-/// Persists the last successfully processed ledger sequence.
+impl LedgerBatch {
+    pub fn new(sequence: u64, tx_count: u32, closed_at: u64) -> Self {
+        Self {
+            sequence,
+            tx_count,
+            closed_at,
+            events: Vec::new(),
+            tx_logs: Vec::new(),
+        }
+    }
+
+    pub fn with_payload(
+        sequence: u64,
+        tx_count: u32,
+        closed_at: u64,
+        events: Vec<IngestionEvent>,
+        tx_logs: Vec<IngestionTransactionLog>,
+    ) -> Self {
+        Self {
+            sequence,
+            tx_count,
+            closed_at,
+            events,
+            tx_logs,
+        }
+    }
+}
+
+/// Persists the last successfully processed ledger sequence and batch ingestion writes.
 #[async_trait::async_trait]
 pub trait LedgerCursorStore: Send + Sync {
     async fn load_cursor(&self) -> Result<Option<u64>, IngestionError>;
     async fn save_cursor(&self, sequence: u64) -> Result<(), IngestionError>;
+
+    /// Atomically persist contract events, transaction logs, and cursor progression
+    /// in a single database transaction. Default falls back to saving cursor.
+    async fn save_batch(
+        &self,
+        sequence: u64,
+        _events: &[IngestionEvent],
+        _tx_logs: &[IngestionTransactionLog],
+    ) -> Result<(), IngestionError> {
+        self.save_cursor(sequence).await
+    }
 }
 
 /// In-memory cursor store used by unit / load tests.
@@ -158,6 +225,66 @@ impl LedgerCursorStore for PostgresCursorStore {
     }
 
     async fn save_cursor(&self, sequence: u64) -> Result<(), IngestionError> {
+        self.save_batch(sequence, &[], &[]).await
+    }
+
+    async fn save_batch(
+        &self,
+        sequence: u64,
+        events: &[IngestionEvent],
+        tx_logs: &[IngestionTransactionLog],
+    ) -> Result<(), IngestionError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| IngestionError::CursorStore(format!("failed to begin transaction: {e}")))?;
+
+        // Write contract events within atomic transaction
+        for event in events {
+            let id = event.id.unwrap_or_else(uuid::Uuid::new_v4);
+            sqlx::query(
+                r#"
+                INSERT INTO contract_events
+                    (id, contract_id, ledger_sequence, transaction_hash, event_index, event_type, topics, data, indexed_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                ON CONFLICT (transaction_hash, event_index) DO NOTHING
+                "#,
+            )
+            .bind(id)
+            .bind(&event.contract_id)
+            .bind(event.ledger_sequence)
+            .bind(&event.transaction_hash)
+            .bind(event.event_index)
+            .bind(&event.event_type)
+            .bind(&event.topics)
+            .bind(&event.data)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| IngestionError::CursorStore(format!("failed to insert contract event: {e}")))?;
+        }
+
+        // Write transaction logs within atomic transaction
+        for log in tx_logs {
+            sqlx::query(
+                r#"
+                INSERT INTO contract_call_logs
+                    (contract_id, function_name, arguments, caller, status, gas_used, timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                "#,
+            )
+            .bind(&log.contract_id)
+            .bind(&log.function_name)
+            .bind(&log.arguments)
+            .bind(&log.caller)
+            .bind(&log.status)
+            .bind(log.gas_used)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| IngestionError::CursorStore(format!("failed to insert transaction log: {e}")))?;
+        }
+
+        // Advance ledger cursor within atomic transaction
         sqlx::query(
             r#"
             INSERT INTO ingestion_cursors (worker_id, last_ledger, updated_at)
@@ -169,9 +296,15 @@ impl LedgerCursorStore for PostgresCursorStore {
         )
         .bind(&self.worker_id)
         .bind(sequence as i64)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| IngestionError::CursorStore(e.to_string()))?;
+        .map_err(|e| IngestionError::CursorStore(format!("failed to update cursor: {e}")))?;
+
+        // Atomically commit batch writes and cursor progression
+        tx.commit()
+            .await
+            .map_err(|e| IngestionError::CursorStore(format!("failed to commit ingestion transaction: {e}")))?;
+
         Ok(())
     }
 }
@@ -344,7 +477,9 @@ impl IngestionPipeline {
 
         let mut processed = 0usize;
         for batch in batches {
-            self.cursor.save_cursor(batch.sequence).await?;
+            self.cursor
+                .save_batch(batch.sequence, &batch.events, &batch.tx_logs)
+                .await?;
             self.last_sequence
                 .store(batch.sequence, Ordering::SeqCst);
             self.ingested.fetch_add(1, Ordering::SeqCst);
@@ -416,11 +551,11 @@ impl LedgerSource for SyntheticLedgerSource {
         let mut out = Vec::with_capacity(self.batch_size as usize);
         for i in 0..self.batch_size {
             let seq = start + u64::from(i);
-            out.push(LedgerBatch {
-                sequence: seq,
-                tx_count: 1 + (seq % 7) as u32,
-                closed_at: 1_700_000_000 + seq,
-            });
+            out.push(LedgerBatch::new(
+                seq,
+                1 + (seq % 7) as u32,
+                1_700_000_000 + seq,
+            ));
         }
         if let Some(last) = out.last() {
             self.next.store(last.sequence + 1, Ordering::SeqCst);
@@ -583,5 +718,42 @@ mod tests {
             Arc::new(InMemoryCursorStore::new()),
         );
         assert!(matches!(res, Err(IngestionError::InvalidConfig(_))));
+    }
+
+    #[tokio::test]
+    async fn ledger_batch_with_payload_and_save_batch() {
+        let cursor = Arc::new(InMemoryCursorStore::new());
+        let event = IngestionEvent {
+            id: None,
+            contract_id: "CA123".to_string(),
+            ledger_sequence: 100,
+            transaction_hash: "tx_hash_1".to_string(),
+            event_index: 0,
+            event_type: "transfer".to_string(),
+            topics: serde_json::json!(["transfer"]),
+            data: serde_json::json!({"amount": 50}),
+        };
+        let log = IngestionTransactionLog {
+            contract_id: "CA123".to_string(),
+            function_name: "mint".to_string(),
+            arguments: serde_json::json!({"to": "GXYZ"}),
+            caller: Some("GXYZ".to_string()),
+            status: "success".to_string(),
+            gas_used: 1250.0,
+        };
+        let batch = LedgerBatch::with_payload(
+            100,
+            1,
+            1_700_000_100,
+            vec![event],
+            vec![log],
+        );
+
+        cursor
+            .save_batch(batch.sequence, &batch.events, &batch.tx_logs)
+            .await
+            .unwrap();
+
+        assert_eq!(cursor.load_cursor().await.unwrap(), Some(100));
     }
 }

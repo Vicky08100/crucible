@@ -10,6 +10,7 @@ fn test_dead_letter_job_serialization() {
         payload: json!({"contract_id": "C123"}),
         failure_reason: "Max retries (5) exceeded: database lock timeout".to_string(),
         attempts: 5,
+        replay_count: 0,
         first_failed_at: now,
         failed_at: now,
     };
@@ -20,5 +21,6 @@ fn test_dead_letter_job_serialization() {
 
     assert_eq!(deserialized.id, "job-999");
     assert_eq!(deserialized.attempts, 5);
+    assert_eq!(deserialized.replay_count, 0);
     assert_eq!(deserialized.job_name, "CONTRACT_VERIFY");
 }
