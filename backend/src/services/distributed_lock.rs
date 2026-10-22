@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -234,6 +235,7 @@ pub struct LockGuard {
     notify: Arc<Notify>,
     heartbeat: Option<JoinHandle<()>>,
     released: bool,
+    cancellation_token: CancellationToken,
 }
 
 impl LockGuard {
@@ -245,6 +247,8 @@ impl LockGuard {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
+        let cancellation_token = CancellationToken::new();
+        let child_token = cancellation_token.clone();
         let heartbeat = {
             let nodes = nodes.clone();
             let resource = resource.clone();
@@ -270,7 +274,8 @@ impl LockGuard {
                             }
                             let quorum = nodes.len() / 2 + 1;
                             if renewed < quorum {
-                                warn!(%resource, renewed, quorum, "redlock heartbeat lost quorum");
+                                warn!(%resource, renewed, quorum, "redlock heartbeat lost quorum; cancelling task");
+                                child_token.cancel();
                                 break;
                             }
                         }
@@ -287,6 +292,7 @@ impl LockGuard {
             notify,
             heartbeat,
             released: false,
+            cancellation_token,
         }
     }
 
@@ -298,6 +304,16 @@ impl LockGuard {
     /// Unique ownership token.
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Cancellation token that gets triggered if the heartbeat renewal fails or loses quorum.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
+    }
+
+    /// Returns true if the lock heartbeat has lost quorum and triggered cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
     }
 
     /// Explicitly release the lock (also called from [`Drop`]).

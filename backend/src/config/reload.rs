@@ -7,6 +7,65 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{info, instrument};
 
+/// Default upper cap for Postgres server connection capacity.
+pub const DEFAULT_POSTGRES_SERVER_CAP: u32 = 1000;
+
+/// Errors that can occur when validating database connection pool limits.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PoolLimitError {
+    #[error("Server capacity must be greater than 0")]
+    InvalidServerCapacity,
+    #[error("Requested pool limit must be greater than 0")]
+    ZeroPoolLimit,
+    #[error("Active in-flight connections ({active}) exceed server capacity ({capacity})")]
+    ActiveExceedsCapacity { active: u32, capacity: u32 },
+}
+
+/// Validates database connection pool limits against server capacity and active query counts:
+/// - Clamps requested max_connections down to server capacity if it exceeds it.
+/// - Clamps requested max_connections up to active in-flight query count if it drops below it,
+///   preventing abrupt termination of active connections.
+pub fn validate_and_adjust_pool_limits(
+    requested_max: u32,
+    active_connections: u32,
+    server_capacity: u32,
+) -> Result<u32, PoolLimitError> {
+    if server_capacity == 0 {
+        return Err(PoolLimitError::InvalidServerCapacity);
+    }
+    if requested_max == 0 {
+        return Err(PoolLimitError::ZeroPoolLimit);
+    }
+    if active_connections > server_capacity {
+        return Err(PoolLimitError::ActiveExceedsCapacity {
+            active: active_connections,
+            capacity: server_capacity,
+        });
+    }
+
+    let mut adjusted = requested_max;
+
+    if adjusted > server_capacity {
+        warn!(
+            requested = requested_max,
+            server_capacity,
+            "Requested database pool max_connections exceeds Postgres server capacity; gracefully clamping to server capacity"
+        );
+        adjusted = server_capacity;
+    }
+
+    if adjusted < active_connections {
+        warn!(
+            requested = adjusted,
+            active_connections,
+            "Requested database pool max_connections is below active in-flight queries; gracefully clamping to active query count to avoid terminating active connections"
+        );
+        adjusted = active_connections;
+    }
+
+    Ok(adjusted)
+}
+
 /// Errors that can occur during configuration reload.
 #[derive(Debug, Error)]
 pub enum ConfigReloadError {
@@ -18,11 +77,17 @@ pub enum ConfigReloadError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("Database pool limit error: {0}")]
+    PoolLimit(#[from] PoolLimitError),
 }
 
 impl IntoResponse for ConfigReloadError {
     fn into_response(self) -> axum::response::Response {
-        let status = StatusCode::INTERNAL_SERVER_ERROR;
+        let status = match self {
+            ConfigReloadError::PoolLimit(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         let body = Json(serde_json::json!({
             "error": self.to_string(),
             "status": status.as_u16()
@@ -68,6 +133,9 @@ pub struct ConfigManager {
     contract_registry: ContractRegistry,
     redis_client: Option<RedisClient>,
     reload_channel: String,
+    server_capacity: u32,
+    active_connections_tracker: Option<Arc<dyn Fn() -> u32 + Send + Sync>>,
+    db_pool: Option<sqlx::PgPool>,
 }
 
 impl ConfigManager {
@@ -78,6 +146,9 @@ impl ConfigManager {
             contract_registry: ContractRegistry::new(),
             redis_client: None,
             reload_channel: "config:reload".to_string(),
+            server_capacity: DEFAULT_POSTGRES_SERVER_CAP,
+            active_connections_tracker: None,
+            db_pool: None,
         }
     }
 
@@ -89,6 +160,34 @@ impl ConfigManager {
     pub fn with_reload_channel(mut self, channel: impl Into<String>) -> Self {
         self.reload_channel = channel.into();
         self
+    }
+
+    pub fn with_server_capacity(mut self, capacity: u32) -> Self {
+        self.server_capacity = capacity;
+        self
+    }
+
+    pub fn with_db_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.db_pool = Some(pool);
+        self
+    }
+
+    pub fn with_active_connections_tracker(
+        mut self,
+        tracker: impl Fn() -> u32 + Send + Sync + 'static,
+    ) -> Self {
+        self.active_connections_tracker = Some(Arc::new(tracker));
+        self
+    }
+
+    pub fn active_connections(&self) -> u32 {
+        if let Some(ref tracker) = self.active_connections_tracker {
+            return tracker();
+        }
+        if let Some(ref pool) = self.db_pool {
+            return (pool.size() as usize).saturating_sub(pool.num_idle()) as u32;
+        }
+        0
     }
 
     pub fn contract_registry(&self) -> &ContractRegistry {
@@ -106,7 +205,16 @@ impl ConfigManager {
         info!("Starting configuration reload...");
 
         let env = Environment::from_env();
-        let new_config = BaseAppConfig::load(env)?;
+        let mut new_config = BaseAppConfig::load(env)?;
+
+        let active = self.active_connections();
+        let adjusted_max = validate_and_adjust_pool_limits(
+            new_config.database.max_connections,
+            active,
+            self.server_capacity,
+        )?;
+        new_config.database.max_connections = adjusted_max;
+
         self.current_config.store(Arc::new(new_config));
 
         if let Some(redis) = &self.redis_client {
@@ -123,7 +231,16 @@ impl ConfigManager {
         let mut conn = redis.get_multiplexed_async_connection().await?;
         let raw: Option<String> = conn.get("config:current").await?;
         let json = raw.ok_or_else(|| ConfigReloadError::LoadError(ConfigError::LoadError("config:current missing".to_string())))?;
-        let new_config: BaseAppConfig = serde_json::from_str(&json)?;
+        let mut new_config: BaseAppConfig = serde_json::from_str(&json)?;
+
+        let active = self.active_connections();
+        let adjusted_max = validate_and_adjust_pool_limits(
+            new_config.database.max_connections,
+            active,
+            self.server_capacity,
+        )?;
+        new_config.database.max_connections = adjusted_max;
+
         self.current_config.store(Arc::new(new_config));
         Ok(())
     }
@@ -143,8 +260,16 @@ impl ConfigManager {
             while let Some(msg) = stream.next().await {
                 let payload: String = msg.get_payload().unwrap_or_default();
                 if !payload.is_empty() {
-                    if let Ok(update) = serde_json::from_str::<BaseAppConfig>(&payload) {
-                        self.current_config.store(Arc::new(update));
+                    if let Ok(mut update) = serde_json::from_str::<BaseAppConfig>(&payload) {
+                        let active = self.active_connections();
+                        if let Ok(adj) = validate_and_adjust_pool_limits(
+                            update.database.max_connections,
+                            active,
+                            self.server_capacity,
+                        ) {
+                            update.database.max_connections = adj;
+                            self.current_config.store(Arc::new(update));
+                        }
                     }
                 }
             }
@@ -172,8 +297,35 @@ impl ConfigManager {
 
         merge_json(&mut current_json, patch);
 
-        let new_config: BaseAppConfig = serde_json::from_value(current_json)
+        // Re-inject sensitive fields skipped during serialization if not overridden by the patch
+        if let Some(db_obj) = current_json.get_mut("database").and_then(|v| v.as_object_mut()) {
+            if !db_obj.contains_key("url") {
+                db_obj.insert("url".to_string(), serde_json::Value::String(current.database.url.clone()));
+            }
+        }
+        if let Some(redis_obj) = current_json.get_mut("redis").and_then(|v| v.as_object_mut()) {
+            if !redis_obj.contains_key("url") {
+                redis_obj.insert("url".to_string(), serde_json::Value::String(current.redis.url.clone()));
+            }
+        }
+        if let Some(tls) = &current.server.tls {
+            if let Some(tls_obj) = current_json.get_mut("server").and_then(|s| s.get_mut("tls")).and_then(|t| t.as_object_mut()) {
+                if !tls_obj.contains_key("key_path") {
+                    tls_obj.insert("key_path".to_string(), serde_json::Value::String(tls.key_path.clone()));
+                }
+            }
+        }
+
+        let mut new_config: BaseAppConfig = serde_json::from_value(current_json)
             .map_err(|e| ConfigReloadError::LoadError(ConfigError::LoadError(e.to_string())))?;
+
+        let active = self.active_connections();
+        let adjusted_max = validate_and_adjust_pool_limits(
+            new_config.database.max_connections,
+            active,
+            self.server_capacity,
+        )?;
+        new_config.database.max_connections = adjusted_max;
 
         self.current_config.store(Arc::new(new_config));
         Ok(())
@@ -347,6 +499,8 @@ pub struct ConfigWatcher {
     inner: Arc<RwLock<AppConfig>>,
     notify_tx: watch::Sender<()>,
     notify_rx: watch::Receiver<()>,
+    server_capacity: u32,
+    active_connections_tracker: Option<Arc<dyn Fn() -> u32 + Send + Sync>>,
 }
 
 impl ConfigWatcher {
@@ -357,7 +511,29 @@ impl ConfigWatcher {
             inner: Arc::new(RwLock::new(initial)),
             notify_tx: tx,
             notify_rx: rx,
+            server_capacity: DEFAULT_POSTGRES_SERVER_CAP,
+            active_connections_tracker: None,
         }
+    }
+
+    pub fn with_server_capacity(mut self, capacity: u32) -> Self {
+        self.server_capacity = capacity;
+        self
+    }
+
+    pub fn with_active_connections_tracker(
+        mut self,
+        tracker: impl Fn() -> u32 + Send + Sync + 'static,
+    ) -> Self {
+        self.active_connections_tracker = Some(Arc::new(tracker));
+        self
+    }
+
+    pub fn active_connections(&self) -> u32 {
+        if let Some(ref tracker) = self.active_connections_tracker {
+            return tracker();
+        }
+        0
     }
 
     /// Return a [`ConfigHandle`] that can be cloned and shared freely.
@@ -369,7 +545,16 @@ impl ConfigWatcher {
     }
 
     /// Atomically replace the current configuration and notify all handles.
-    pub async fn reload(&self, new_config: AppConfig) {
+    pub async fn reload(&self, mut new_config: AppConfig) {
+        let active = self.active_connections();
+        if let Ok(adjusted) = validate_and_adjust_pool_limits(
+            new_config.max_connections,
+            active,
+            self.server_capacity,
+        ) {
+            new_config.max_connections = adjusted;
+        }
+
         let old = {
             let mut guard = self.inner.write().await;
             let old = guard.clone();
@@ -655,5 +840,93 @@ mod tests {
         }
 
         assert_eq!(manager.contract_registry().load().len(), 1);
+    }
+
+    #[test]
+    fn test_validate_and_adjust_pool_limits_caps_to_server_capacity() {
+        // When requested exceeds server capacity (e.g. 500 > 100), clamp to 100
+        let adjusted = validate_and_adjust_pool_limits(500, 10, 100).unwrap();
+        assert_eq!(adjusted, 100);
+    }
+
+    #[test]
+    fn test_validate_and_adjust_pool_limits_clamps_to_active_connections() {
+        // When requested drops below active queries (e.g. 5 < 20), clamp to 20 to avoid terminating active queries
+        let adjusted = validate_and_adjust_pool_limits(5, 20, 100).unwrap();
+        assert_eq!(adjusted, 20);
+    }
+
+    #[test]
+    fn test_validate_and_adjust_pool_limits_errors() {
+        // Zero server capacity
+        assert_eq!(
+            validate_and_adjust_pool_limits(50, 10, 0),
+            Err(PoolLimitError::InvalidServerCapacity)
+        );
+        // Zero requested max
+        assert_eq!(
+            validate_and_adjust_pool_limits(0, 10, 100),
+            Err(PoolLimitError::ZeroPoolLimit)
+        );
+        // Active exceeds server capacity
+        assert_eq!(
+            validate_and_adjust_pool_limits(50, 120, 100),
+            Err(PoolLimitError::ActiveExceedsCapacity {
+                active: 120,
+                capacity: 100
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_watcher_gracefully_clamps_pool_limits() {
+        let watcher = default_watcher()
+            .with_server_capacity(80)
+            .with_active_connections_tracker(|| 15);
+
+        // Try setting max_connections to 200 (exceeds 80)
+        watcher
+            .reload(AppConfig {
+                max_connections: 200,
+                ..AppConfig::default()
+            })
+            .await;
+        assert_eq!(watcher.handle().get().await.max_connections, 80);
+
+        // Try dropping max_connections to 5 (below active 15)
+        watcher
+            .reload(AppConfig {
+                max_connections: 5,
+                ..AppConfig::default()
+            })
+            .await;
+        assert_eq!(watcher.handle().get().await.max_connections, 15);
+    }
+
+    #[test]
+    fn test_config_manager_patch_gracefully_adjusts_pool_limits() {
+        let manager = ConfigManager::new(BaseAppConfig::default())
+            .with_server_capacity(50)
+            .with_active_connections_tracker(|| 12);
+
+        // Patch with max_connections = 200 (exceeds capacity 50)
+        manager
+            .update_from_patch(serde_json::json!({
+                "database": {
+                    "max_connections": 200
+                }
+            }))
+            .unwrap();
+        assert_eq!(manager.load().database.max_connections, 50);
+
+        // Patch with max_connections = 3 (below active 12)
+        manager
+            .update_from_patch(serde_json::json!({
+                "database": {
+                    "max_connections": 3
+                }
+            }))
+            .unwrap();
+        assert_eq!(manager.load().database.max_connections, 12);
     }
 }

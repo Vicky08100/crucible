@@ -1,3 +1,9 @@
+## [1.35.0](https://github.com/benelabs/crucible/compare/v1.34.2...v1.35.0) (2026-10-22)
+
+### Features
+
+* **backend:** fix circuit breaker sliding window, distributed lock cancellation, config pool limits, and resilient cache invalidation ([cbd1118](https://github.com/benelabs/crucible/commit/cbd11184267380429c57cf00ac136af92fa49e7b)), closes [#1170](https://github.com/benelabs/crucible/issues/1170) [#1171](https://github.com/benelabs/crucible/issues/1171) [#1186](https://github.com/benelabs/crucible/issues/1186) [#1173](https://github.com/benelabs/crucible/issues/1173) [#1170](https://github.com/benelabs/crucible/issues/1170) [#1171](https://github.com/benelabs/crucible/issues/1171) [#1173](https://github.com/benelabs/crucible/issues/1173) [#1186](https://github.com/benelabs/crucible/issues/1186)
+
 ## [1.34.2](https://github.com/benelabs/crucible/compare/v1.34.1...v1.34.2) (2026-10-17)
 
 ### Bug Fixes
